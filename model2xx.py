@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Octopus: Database-Driven Execution Engine.
-Fetches signals from the PostgreSQL database populated by inference.py.
-- ALIGNED: 30m intervals (UTC).
-- SOURCE: PostgreSQL 'signal' table.
-- EXECUTION: Kraken Futures Maker Loop.
+Octopus: Database-Driven Execution Engine (Fixed Maturity Edition).
+Targets Kraken 'FF' (Fixed Maturity Linear) contracts for 1-week ahead.
 """
 
 import os
@@ -12,7 +9,7 @@ import sys
 import time
 import logging
 import psycopg2
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple
 
@@ -30,39 +27,21 @@ try:
 except ImportError:
     pass
 
-# API & DB Keys
 KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Global Settings
 LEVERAGE = 10
 TIMEFRAME_MINUTES = 30
-TRIGGER_OFFSET_SEC = 30  # Wait 30s for inference to finish writing
+TRIGGER_OFFSET_SEC = 30 
 
-# Asset Mapping (Inference Symbol -> Kraken Futures Perpetual)
-SYMBOL_MAP = {
-    "BTC/USDT": "ff_xbtusd_260327",
-    "ETH/USDT": "pf_ethusd",
-    "SOL/USDT": "pf_solusd",
-    "XRP/USDT": "pf_xrpusd",
-    "ADA/USDT": "pf_adausd",
-    "AVAX/USDT": "pf_avaxusd",
-    "DOT/USDT": "pf_dotusd",
-    "LTC/USDT": "pf_ltcusd",
-    "BCH/USDT": "pf_bchusd",
-    "LINK/USDT": "pf_linkusd",
-    "UNI/USDT": "pf_uniusd",
-    "AAVE/USDT": "pf_aaveusd",
-    "NEAR/USDT": "pf_nearusd",
-    "FIL/USDT": "pf_filusd",
-    "ALGO/USDT": "pf_algousd",
-    "XLM/USDT": "pf_xlmusd",
-    "EOS/USDT": "pf_eosusd",
-    "DOGE/USDT": "pf_dogeusd",
-    "SHIB/USDT": "pf_shibusd",
-    "SAND/USDT": "pf_sandusd"
-}
+# Base mapping (Inference Asset -> Kraken Base)
+# Note: FF contracts are typically available for majors (BTC, ETH). 
+# If a symbol is not found as FF, the bot will log an error for that specific asset.
+ASSETS = [
+    "BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "DOT", "LTC", "BCH", "LINK",
+    "UNI", "AAVE", "NEAR", "FIL", "ALGO", "XLM", "EOS", "DOGE", "SHIB", "SAND"
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +50,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Octopus")
 
+# --- Helper Logic ---
+
+def get_target_expiry():
+    """
+    Calculates the '1 week ahead' Friday expiry.
+    Kraken Fixed Maturity contracts usually expire on Fridays at 08:00 UTC.
+    """
+    now = datetime.now(timezone.utc)
+    # Find next Friday (weekday 4)
+    days_until_friday = (4 - now.weekday()) % 7
+    if days_until_friday == 0 and now.hour >= 8: # If today is Friday after expiry
+        days_until_friday = 7
+    
+    # Target "1 week ahead" means the Friday AFTER the immediate next one
+    target_date = now + timedelta(days=days_until_friday + 7)
+    return target_date.strftime("%y%m%d")
+
+TARGET_EXPIRY = get_target_expiry()
+# Construct SYMBOL_MAP: e.g., "BTC/USDT" -> "ff_xbtusd_260130"
+SYMBOL_MAP = {f"{a}/USDT": f"ff_{a.lower().replace('btc', 'xbt')}usd_{TARGET_EXPIRY}" for a in ASSETS}
+
 # --- Database Signal Fetcher ---
 
 class DatabaseFetcher:
@@ -78,28 +78,20 @@ class DatabaseFetcher:
         self.db_url = db_url
 
     def fetch_signals(self) -> Tuple[Dict[str, int], int]:
-        """Reads signals from DB and converts to numeric votes."""
         votes = {}
         total_strategies = 0
-        
         if not self.db_url:
-            logger.error("DATABASE_URL not set.")
             return {}, 0
-
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
             cur.execute("SELECT asset, prediction FROM signal;")
             rows = cur.fetchall()
-            
             signal_map = {"LONG": 1, "SHORT": -1, "NEUTRAL": 0}
-            
             for asset, pred in rows:
                 if asset in SYMBOL_MAP:
-                    vote = signal_map.get(pred, 0)
-                    votes[asset] = vote
+                    votes[asset] = signal_map.get(pred, 0)
                     total_strategies += 1
-            
             cur.close()
             conn.close()
             return votes, total_strategies
@@ -117,7 +109,7 @@ class Octopus:
         self.instrument_specs = {}
 
     def initialize(self):
-        logger.info("Initializing Octopus (DB Mode)...")
+        logger.info(f"Initializing Octopus (FF Mode | Expiry: {TARGET_EXPIRY})...")
         self._fetch_instrument_specs()
         
         try:
@@ -126,6 +118,10 @@ class Octopus:
                 logger.error(f"API Error: {acc}")
             else:
                 logger.info("Kraken API Connected.")
+                # Verify if our FF symbols exist in the exchange specs
+                for asset, kf_sym in SYMBOL_MAP.items():
+                    if kf_sym.lower() not in self.instrument_specs:
+                        logger.warning(f"Contract {kf_sym} not found on exchange. Majors only?")
         except Exception as e:
             logger.error(f"API Connection Failed: {e}")
 
@@ -150,38 +146,32 @@ class Octopus:
         return round(round(value / step) * step, 8)
 
     def run(self):
-        logger.info(f"Bot Active. Syncing every {TIMEFRAME_MINUTES}m at {TRIGGER_OFFSET_SEC}s offset.")
+        logger.info(f"Bot Active. Targeting FF week: {TARGET_EXPIRY}")
         while True:
             now = datetime.now(timezone.utc)
-            
-            # Logic: (Current minute is 0 or 30) AND (Second is 30)
             if now.minute % TIMEFRAME_MINUTES == 0 and now.second == TRIGGER_OFFSET_SEC:
                 logger.info(f"--- Trigger Time: {now.strftime('%H:%M:%S')} UTC ---")
                 self._process_signals()
-                time.sleep(2) # Prevent double trigger
-            
+                time.sleep(2) 
             time.sleep(0.5)
 
     def _process_signals(self):
         asset_votes, total_strategies = self.fetcher.fetch_signals()
-        
         if total_strategies == 0:
             logger.warning("No signals found in database.")
             return
 
         try:
             acc = self.kf.get_accounts()
-            # Logic to find Flex Equity
             flex_data = acc.get("accounts", {}).get("flex", {})
             equity = float(flex_data.get("marginEquity", 0))
             
             if equity <= 0:
-                logger.error("Equity is 0 or account inaccessible.")
+                logger.error("Equity is 0. Check Multi-Collateral / Flex wallet.")
                 return
 
-            # (Total Wallet Value * Leverage) / Number of Assets tracked
             unit_size_usd = (equity * LEVERAGE) / total_strategies
-            logger.info(f"Equity: ${equity:.2f} | Unit Size: ${unit_size_usd:.2f}")
+            logger.info(f"Equity: ${equity:.2f} | Target per Asset: ${unit_size_usd:.2f}")
 
             for asset, vote in asset_votes.items():
                 target_usd = vote * unit_size_usd
@@ -192,10 +182,11 @@ class Octopus:
 
     def _execute_logic(self, binance_asset: str, target_usd: float):
         kf_symbol = SYMBOL_MAP.get(binance_asset)
-        if not kf_symbol: return
+        if not kf_symbol or kf_symbol.lower() not in self.instrument_specs:
+            return
 
         try:
-            # 1. Get Current Position
+            # 1. Position Check
             pos_resp = self.kf.get_open_positions()
             current_qty = 0.0
             for p in pos_resp.get("openPositions", []):
@@ -203,7 +194,7 @@ class Octopus:
                     current_qty = float(p["size"]) if p["side"] == "long" else -float(p["size"])
                     break
             
-            # 2. Get Price
+            # 2. Pricing
             tick_resp = self.kf.get_tickers()
             mark_price = 0.0
             for t in tick_resp.get("tickers", []):
@@ -213,17 +204,15 @@ class Octopus:
             
             if mark_price == 0: return
 
-            # 3. Calculate Delta
+            # 3. Execution
             target_qty = target_usd / mark_price
             delta = target_qty - current_qty
             
-            specs = self.instrument_specs.get(kf_symbol.lower(), {"sizeStep": 0.0001, "tickSize": 0.1})
+            specs = self.instrument_specs[kf_symbol.lower()]
             if abs(delta) < specs["sizeStep"]:
                 return
 
-            logger.info(f"[{kf_symbol}] Side: {'BUY' if delta > 0 else 'SELL'} | Delta: {delta:.4f}")
-            
-            # Run Maker Loop (Aggression starting at 0bp, increasing 1bp every 5s for 1 min)
+            logger.info(f"[{kf_symbol}] Delta: {delta:.4f} @ ${mark_price}")
             self._run_maker_loop(kf_symbol, delta, mark_price, 60, 5, 0, 1.0)
 
         except Exception as e:
@@ -232,13 +221,12 @@ class Octopus:
     def _run_maker_loop(self, symbol, quantity, price, duration, interval, start_bp, step_bp):
         side = "buy" if quantity > 0 else "sell"
         abs_qty = abs(quantity)
-        specs = self.instrument_specs.get(symbol.lower(), {"sizeStep": 0.001, "tickSize": 0.1})
+        specs = self.instrument_specs[symbol.lower()]
         
         order_id = None
         steps = duration // interval
 
         for i in range(steps + 1):
-            # Calculate dynamic limit price based on aggression
             aggression = (start_bp + (i * step_bp)) * 0.0001
             adjustment = 1 + aggression if side == "buy" else 1 - aggression
             limit_price = self._round_to_step(price * adjustment, specs["tickSize"])
@@ -250,7 +238,6 @@ class Octopus:
                     order_id = res.get("sendStatus", {}).get("order_id")
                 else:
                     self.kf.edit_order({"orderId": order_id, "limitPrice": limit_price, "size": size, "symbol": symbol})
-                
                 time.sleep(interval)
             except Exception as e:
                 logger.debug(f"Maker step error: {e}")
