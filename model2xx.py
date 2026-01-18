@@ -36,7 +36,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Global Settings
-LEVERAGE = 70
+LEVERAGE = 10
 TIMEFRAME_MINUTES = 30
 TRIGGER_OFFSET_SEC = 30  # Wait 30s for inference to finish writing
 
