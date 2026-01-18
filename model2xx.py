@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Octopus: Database-Driven Execution Engine (Month-End FF Edition).
-Enhanced with step-by-step logging and throttled output.
+Octopus: Database-Driven Execution Engine (Month-End FF & PF Mixed Edition).
 """
 
 import os
@@ -38,12 +37,28 @@ TIMEFRAME_MINUTES = 30
 TRIGGER_OFFSET_SEC = 30 
 LOG_LOCK = threading.Lock()
 
-ASSETS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
-    "AVAX/USDT", "DOT/USDT", "LTC/USDT", "BCH/USDT", "LINK/USDT",
-    "UNI/USDT", "AAVE/USDT", "NEAR/USDT", "FIL/USDT", "ALGO/USDT",
-    "XLM/USDT", "EOS/USDT", "DOGE/USDT", "SHIB/USDT", "SAND/USDT"
-]
+# --- Asset Configuration ---
+
+# Assets configured for Perpetual Futures (PF)
+PERP_ASSETS = {
+    "AAVE/USDT", "NEAR/USDT", "FIL/USDT", 
+    "ALGO/USDT", "EOS/USDT", "SAND/USDT"
+}
+
+# Assets configured for Fixed Futures (FF)
+FF_ASSETS = {
+    "ETH/USDT", "SOL/USDT"
+}
+
+# Active Trading List
+ASSETS = list(FF_ASSETS) + list(PERP_ASSETS)
+
+# Inactive/Deactivated Assets (Kept in script for reference)
+# INACTIVE_ASSETS = [
+#     "BTC/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", 
+#     "DOT/USDT", "LTC/USDT", "BCH/USDT", "LINK/USDT", 
+#     "UNI/USDT", "XLM/USDT", "DOGE/USDT", "SHIB/USDT"
+# ]
 
 # Configure standard logging for the file
 logging.basicConfig(
@@ -93,19 +108,26 @@ def get_last_friday_expiry():
 
 TARGET_EXPIRY = get_last_friday_expiry()
 
-def map_to_kraken_ff(binance_asset: str) -> str:
+def map_to_kraken_symbol(binance_asset: str) -> str:
+    """Maps Binance tickers to Kraken PF or FF symbols based on configuration."""
     base = binance_asset.split('/')[0].lower()
     if base == "btc": base = "xbt"
+
+    # Check against Perpetual set
+    if binance_asset in PERP_ASSETS:
+        return f"pf_{base}usd"
+    
+    # Default to Fixed Maturity
     return f"ff_{base}usd_{TARGET_EXPIRY}"
 
-SYMBOL_MAP = {a: map_to_kraken_ff(a) for a in ASSETS}
+SYMBOL_MAP = {a: map_to_kraken_symbol(a) for a in ASSETS}
 
 # --- Main Engine ---
 
 class Octopus:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.executor = ThreadPoolExecutor(max_workers=5) # Reduced workers to keep logs readable
+        self.executor = ThreadPoolExecutor(max_workers=5)
         self.instrument_specs = {}
 
     def initialize(self):
@@ -121,7 +143,7 @@ class Octopus:
                 octopus_log("API Connection: SUCCESS")
             
             valid_contracts = [s for s in SYMBOL_MAP.values() if s in self.instrument_specs]
-            octopus_log(f"Contract Audit: {len(valid_contracts)}/{len(ASSETS)} symbols valid for {TARGET_EXPIRY}")
+            octopus_log(f"Contract Audit: {len(valid_contracts)}/{len(ASSETS)} symbols valid")
             
             if len(valid_contracts) < len(ASSETS):
                 missing = set(SYMBOL_MAP.values()) - set(self.instrument_specs.keys())
@@ -183,6 +205,7 @@ class Octopus:
                 octopus_log("Insufficient Flex Equity. Blocking execution.", "error")
                 return
 
+            # Dynamically calculate size based on Active ASSETS list length
             unit_size_usd = (equity * LEVERAGE) / len(ASSETS)
             octopus_log(f"Portfolio Stats | Equity: ${equity:,.2f} | Leverage: {LEVERAGE}x | Allocation/Asset: ${unit_size_usd:,.2f}")
 
@@ -203,6 +226,7 @@ class Octopus:
         try:
             pos_resp = self.kf.get_open_positions()
             current_qty = 0.0
+            # Parse open positions
             for p in pos_resp.get("openPositions", []):
                 if p["symbol"].lower() == kf_symbol:
                     current_qty = float(p["size"]) if p["side"] == "long" else -float(p["size"])
@@ -252,6 +276,8 @@ class Octopus:
             try:
                 if not order_id:
                     res = self.kf.send_order({"orderType": "lmt", "symbol": symbol, "side": side, "size": size, "limitPrice": limit_price})
+                    if "error" in res:
+                        raise Exception(f"API Error: {res}")
                     order_id = res.get("sendStatus", {}).get("order_id")
                     octopus_log(f"[{symbol}] Initial Order Placed: {order_id} at {limit_price}")
                 else:
@@ -261,6 +287,7 @@ class Octopus:
                 time.sleep(interval)
             except Exception as e:
                 octopus_log(f"[{symbol}] Loop Step {i} failed: {e}", "warning")
+                # If order placement failed, order_id remains None, enabling retry in next loop
 
         if order_id:
             octopus_log(f"[{symbol}] Loop finished. Cancelling remaining order {order_id}.")
