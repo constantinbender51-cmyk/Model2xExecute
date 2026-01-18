@@ -1,273 +1,290 @@
-#!/usr/bin/env python3
-"""
-Octopus: Database-Driven Execution Engine (Month-End FF Edition).
-Enhanced with step-by-step logging and throttled output.
-"""
-
 import os
 import sys
+import pickle
 import time
+import pandas as pd
+import numpy as np
+import ccxt
+import psycopg2 
 import logging
-import psycopg2
-import calendar
-import threading
+import random
+import json
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Tuple
+from collections import Counter
+from huggingface_hub import hf_hub_download
 
-# --- Local Imports ---
-try:
-    from kraken_futures import KrakenFuturesApi
-except ImportError:
-    print("CRITICAL: 'kraken_futures.py' not found.")
-    sys.exit(1)
-
-# --- Configuration ---
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
-KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-LEVERAGE = 10
-TIMEFRAME_MINUTES = 30
-TRIGGER_OFFSET_SEC = 30 
-LOG_LOCK = threading.Lock()
-
-ASSETS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
-    "AVAX/USDT", "DOT/USDT", "LTC/USDT", "BCH/USDT", "LINK/USDT",
-    "UNI/USDT", "AAVE/USDT", "NEAR/USDT", "FIL/USDT", "ALGO/USDT",
-    "XLM/USDT", "EOS/USDT", "DOGE/USDT", "SHIB/USDT", "SAND/USDT"
-]
-
-# Configure standard logging for the file
+# --- LOGGING CONFIGURATION ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("octopus_exec.log")]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('inference.log'),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger("Octopus")
+logger = logging.getLogger(__name__)
 
-def octopus_log(msg, level="info"):
-    """Custom print function with 1s delay and thread safety."""
-    with LOG_LOCK:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        formatted_msg = f"[{timestamp}] {msg}"
-        print(formatted_msg)
-        
-        if level == "info": logger.info(msg)
-        elif level == "error": logger.error(msg)
-        elif level == "warning": logger.warning(msg)
-        
-        time.sleep(1)
+# --- CONFIGURATION ---
+ASSETS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT', 
+    'AVAX/USDT', 'DOT/USDT', 'LTC/USDT', 'BCH/USDT',
+    'LINK/USDT', 'UNI/USDT', 'AAVE/USDT', 'NEAR/USDT', 
+    'FIL/USDT', 'ALGO/USDT', 'XLM/USDT', 'EOS/USDT',
+    'DOGE/USDT', 'SHIB/USDT', 'SAND/USDT'
+]
 
-# --- Expiry & Mapping Logic ---
+TIMEFRAME = '30m'
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATA_DIR = "/app/data"
+HF_REPO_ID = "Llama26051996/Models" 
+HF_FOLDER = "model2x"
 
-def get_last_friday_expiry():
-    octopus_log("Calculating target expiry for Kraken FF contracts...")
-    now = datetime.now(timezone.utc)
-    
-    def last_friday_of_month(year, month):
-        last_day = calendar.monthrange(year, month)[1]
-        dt = datetime(year, month, last_day, 8, 0, tzinfo=timezone.utc)
-        while dt.weekday() != 4: # 4 = Friday
-            dt -= timedelta(days=1)
-        return dt
+REQUEST_DELAY = 0.5
+ENTRY_TRACKER_FILE = "entry_prices.json"
 
-    target_dt = last_friday_of_month(now.year, now.month)
-    if now >= target_dt:
-        octopus_log("Current date past this month's expiry. Rolling to next month.")
-        if now.month == 12:
-            target_dt = last_friday_of_month(now.year + 1, 1)
-        else:
-            target_dt = last_friday_of_month(now.year, now.month + 1)
-            
-    expiry_str = target_dt.strftime("%y%m%d")
-    octopus_log(f"Target Expiry Identified: {expiry_str}")
-    return expiry_str
+def ensure_directories():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-TARGET_EXPIRY = get_last_friday_expiry()
+# --- ENTRY PRICE TRACKING (NOT IN DB) ---
 
-def map_to_kraken_ff(binance_asset: str) -> str:
-    base = binance_asset.split('/')[0].lower()
-    if base == "btc": base = "xbt"
-    return f"ff_{base}usd_{TARGET_EXPIRY}"
-
-SYMBOL_MAP = {a: map_to_kraken_ff(a) for a in ASSETS}
-
-# --- Main Engine ---
-
-class Octopus:
-    def __init__(self):
-        self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.executor = ThreadPoolExecutor(max_workers=5) # Reduced workers to keep logs readable
-        self.instrument_specs = {}
-
-    def initialize(self):
-        octopus_log("--- Initializing Octopus Engine ---")
-        self._fetch_instrument_specs()
-        
+def load_entry_prices():
+    if os.path.exists(ENTRY_TRACKER_FILE):
         try:
-            octopus_log("Verifying Kraken API connectivity...")
-            acc = self.kf.get_accounts()
-            if "error" in acc: 
-                octopus_log(f"API Error detected: {acc}", "error")
-            else:
-                octopus_log("API Connection: SUCCESS")
-            
-            valid_contracts = [s for s in SYMBOL_MAP.values() if s in self.instrument_specs]
-            octopus_log(f"Contract Audit: {len(valid_contracts)}/{len(ASSETS)} symbols valid for {TARGET_EXPIRY}")
-            
-            if len(valid_contracts) < len(ASSETS):
-                missing = set(SYMBOL_MAP.values()) - set(self.instrument_specs.keys())
-                octopus_log(f"Unavailable Contracts: {missing}", "warning")
-        except Exception as e:
-            octopus_log(f"Initialization Critical Failure: {e}", "error")
+            with open(ENTRY_TRACKER_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-    def _fetch_instrument_specs(self):
-        octopus_log("Fetching instrument specifications from Kraken...")
+def save_entry_prices(tracker):
+    with open(ENTRY_TRACKER_FILE, 'w') as f:
+        json.dump(tracker, f)
+
+# --- DATABASE FUNCTIONS ---
+
+def get_db_connection():
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL environment variable not found.")
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        return None
+
+def init_db():
+    """Initializes tables and renames 'outcome' to 'pnl'"""
+    logger.info("Initializing database and migrating columns...")
+    conn = get_db_connection()
+    if conn:
         try:
-            import requests
-            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            resp = requests.get(url).json()
-            if "instruments" in resp:
-                for inst in resp["instruments"]:
-                    sym = inst["symbol"].lower()
-                    precision = inst.get("contractValueTradePrecision", 3)
-                    self.instrument_specs[sym] = {
-                        "sizeStep": 10 ** (-int(precision)),
-                        "tickSize": float(inst.get("tickSize", 0.1))
-                    }
-                octopus_log(f"Successfully cached specs for {len(self.instrument_specs)} instruments.")
-        except Exception as e:
-            octopus_log(f"Failed to fetch specs: {e}", "error")
-
-    def _round_to_step(self, value, step):
-        return round(round(value / step) * step, 8) if step != 0 else value
-
-    def run(self):
-        octopus_log(f"Bot Active. Strategy: {TIMEFRAME_MINUTES}m Rebalance | Trigger Offset: {TRIGGER_OFFSET_SEC}s")
-        while True:
-            now = datetime.now(timezone.utc)
-            if now.minute % TIMEFRAME_MINUTES == 0 and now.second == TRIGGER_OFFSET_SEC:
-                octopus_log(f">>> REBALANCE TRIGGERED AT {now.strftime('%H:%M:%S')} <<<")
-                self._process_signals()
-                octopus_log("Cycle complete. Returning to sleep.")
-                time.sleep(2) 
-            time.sleep(0.5)
-
-    def _process_signals(self):
-        try:
-            octopus_log("Connecting to PostgreSQL to fetch latest signals...")
-            conn = psycopg2.connect(DATABASE_URL)
             cur = conn.cursor()
-            cur.execute("SELECT asset, prediction FROM signal;")
-            rows = cur.fetchall()
+            # 1. Ensure tables exist
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal (
+                    asset TEXT PRIMARY KEY,
+                    prediction TEXT,
+                    start_time TIMESTAMP,
+                    end_time TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal_history (
+                    time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    asset TEXT NOT NULL,
+                    prediction TEXT NOT NULL,
+                    pnl NUMERIC NOT NULL,
+                    PRIMARY KEY (time, asset)
+                );
+            """)
+            # 2. Migration: Rename outcome to pnl if the old column exists
+            cur.execute("""
+                DO $$ 
+                BEGIN 
+                    IF EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='signal_history' AND column_name='outcome') THEN
+                        ALTER TABLE signal_history RENAME COLUMN outcome TO pnl;
+                    END IF;
+                END $$;
+            """)
+            conn.commit()
             cur.close()
             conn.close()
-            octopus_log(f"Signals retrieved: {len(rows)} assets found in DB.")
-            
-            signal_map = {"LONG": 1, "SHORT": -1, "NEUTRAL": 0}
-            asset_votes = {asset: signal_map.get(pred, 0) for asset, pred in rows if asset in SYMBOL_MAP}
-            
-            octopus_log("Retrieving Kraken Flex Equity...")
-            acc = self.kf.get_accounts()
-            equity = float(acc.get("accounts", {}).get("flex", {}).get("marginEquity", 0))
-            
-            if equity <= 0:
-                octopus_log("Insufficient Flex Equity. Blocking execution.", "error")
-                return
-
-            unit_size_usd = (equity * LEVERAGE) / len(ASSETS)
-            octopus_log(f"Portfolio Stats | Equity: ${equity:,.2f} | Leverage: {LEVERAGE}x | Allocation/Asset: ${unit_size_usd:,.2f}")
-
-            octopus_log("Dispatching execution threads for assets...")
-            for asset, vote in asset_votes.items():
-                target_usd = vote * unit_size_usd
-                self.executor.submit(self._execute_logic, asset, target_usd)
-
+            logger.info("Database migration complete.")
         except Exception as e:
-            octopus_log(f"Process Loop Error: {e}", "error")
+            logger.error(f"Failed to init DB: {e}")
 
-    def _execute_logic(self, binance_asset: str, target_usd: float):
-        kf_symbol = SYMBOL_MAP[binance_asset]
-        if kf_symbol not in self.instrument_specs: 
-            octopus_log(f"Skipping {kf_symbol}: No specs found.", "warning")
-            return
-
-        try:
-            pos_resp = self.kf.get_open_positions()
-            current_qty = 0.0
-            for p in pos_resp.get("openPositions", []):
-                if p["symbol"].lower() == kf_symbol:
-                    current_qty = float(p["size"]) if p["side"] == "long" else -float(p["size"])
-                    break
-            
-            tick_resp = self.kf.get_tickers()
-            mark_price = next((float(t["markPrice"]) for t in tick_resp["tickers"] if t["symbol"].lower() == kf_symbol), 0)
-            
-            if mark_price == 0: 
-                octopus_log(f"[{kf_symbol}] Could not fetch mark price.", "error")
-                return
-
-            target_qty = target_usd / mark_price
-            delta = target_qty - current_qty
-            
-            specs = self.instrument_specs[kf_symbol]
-            if abs(delta) < specs["sizeStep"]:
-                octopus_log(f"[{kf_symbol}] Delta {delta:.4f} below min step. No trade needed.")
-                return
-
-            octopus_log(f"[{kf_symbol}] Target: {target_qty:.4f} | Current: {current_qty:.4f} | Delta: {delta:.4f}")
-            self._run_maker_loop(kf_symbol, delta, mark_price)
-
-        except Exception as e:
-            octopus_log(f"Execution Error {kf_symbol}: {e}", "error")
-
-    def _run_maker_loop(self, symbol, quantity, mark_price):
-        """Aggressive Maker Loop with 1s logging per adjustment."""
-        side = "buy" if quantity > 0 else "sell"
-        abs_qty = abs(quantity)
-        specs = self.instrument_specs[symbol]
+def settle_and_update_fast(asset, new_pred, p_market, entry_tracker):
+    """
+    1. Updates signal state with timestamps.
+    2. Calculates pnl from entry price (stored in json) and exit price.
+    """
+    conn = get_db_connection()
+    if not conn: return
+    
+    try:
+        cur = conn.cursor()
         
-        order_id = None
-        duration = 60
-        interval = 5
-        steps = duration // interval 
-
-        octopus_log(f"[{symbol}] Starting 60s Maker Loop. Side: {side.upper()}")
-
-        for i in range(steps + 1):
-            aggression_bps = i * 1.0 
-            adjustment = 1 + (aggression_bps * 0.0001) if side == "buy" else 1 - (aggression_bps * 0.0001)
+        # Check previous prediction from DB
+        cur.execute("SELECT prediction FROM signal WHERE asset = %s", (asset,))
+        row = cur.fetchone()
+        prev_pred_str = row[0] if row else None
+        
+        # Calculate PNL if previous signal was valid and we have an entry price
+        if prev_pred_str in ["LONG", "SHORT"] and asset in entry_tracker:
+            p_entry = entry_tracker[asset]
+            p_exit = p_market
+            side = 1.0 if prev_pred_str == "LONG" else -1.0
+            pnl = round(side * ((p_exit - p_entry) / p_entry) * 100, 6)
             
-            limit_price = self._round_to_step(mark_price * adjustment, specs["tickSize"])
-            size = self._round_to_step(abs_qty, specs["sizeStep"])
+            cur.execute("""
+                INSERT INTO signal_history (time, asset, prediction, pnl)
+                VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
+            """, (asset, prev_pred_str, pnl))
+            conn.commit() # Separate commit for history
+            
+            icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+            logger.info(f"{asset:12} | Exit: {p_exit:.4f} | PNL: {pnl:+.4f}% {icon}")
 
-            try:
-                if not order_id:
-                    res = self.kf.send_order({"orderType": "lmt", "symbol": symbol, "side": side, "size": size, "limitPrice": limit_price})
-                    order_id = res.get("sendStatus", {}).get("order_id")
-                    octopus_log(f"[{symbol}] Initial Order Placed: {order_id} at {limit_price}")
-                else:
-                    self.kf.edit_order({"orderId": order_id, "limitPrice": limit_price, "size": size, "symbol": symbol})
-                    octopus_log(f"[{symbol}] Adjustment {i}: Price moved to {limit_price} (+{aggression_bps}bps)")
+        # Update Current Signal Table
+        start_t = datetime.now(timezone.utc)
+        end_t = start_t + timedelta(minutes=30)
+        cur.execute("""
+            INSERT INTO signal (asset, prediction, start_time, end_time)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (asset) 
+            DO UPDATE SET 
+                prediction = EXCLUDED.prediction,
+                start_time = EXCLUDED.start_time,
+                end_time = EXCLUDED.end_time;
+        """, (asset, new_pred, start_t, end_t))
+        conn.commit() # Separate commit for signal update
+        
+        # Record NEW entry price locally
+        entry_tracker[asset] = p_market
+        save_entry_prices(entry_tracker)
+        
+        if not prev_pred_str:
+            logger.info(f"{asset:12} | New: {new_pred:8} | Initial Run")
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed update for {asset}: {e}")
+
+# --- DATA & MODEL FUNCTIONS ---
+
+def get_model_filename(symbol):
+    return f"{symbol.split('/')[0].lower()}.pkl"
+
+def download_models():
+    model_paths = {}
+    for symbol in ASSETS:
+        fname = get_model_filename(symbol)
+        try:
+            path = hf_hub_download(repo_id=HF_REPO_ID, filename=f"{HF_FOLDER}/{fname}", local_dir=".")
+            model_paths[symbol] = path
+        except Exception as e:
+            logger.warning(f"Could not download model for {symbol}: {e}")
+            continue
+    return model_paths
+
+def load_all_models(model_paths_dict):
+    loaded_models = {}
+    for symbol, path in model_paths_dict.items():
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+                loaded_models[symbol] = data
+        except Exception as e:
+            logger.error(f"Failed to load model {symbol}: {e}")
+            continue
+    return loaded_models
+
+def run_single_asset_live(symbol, anchor_price, model_data, exchange):
+    configs = model_data['ensemble_configs']
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
+        if len(ohlcv) < 3: return "ERROR", None
+        
+        p_market = ohlcv[-2][4]  # Close of last completed candle
+        
+        live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        log_prices = np.log(live_df['close'].to_numpy() / anchor_price)
+        
+        up, down = 0, 0
+        for cfg in configs:
+            grid = np.floor(log_prices / cfg['step_size']).astype(int)
+            if len(grid) < cfg['seq_len']: continue
+            seq = tuple(grid[-cfg['seq_len']:])
+            if seq in cfg['patterns']:
+                pred_lvl = Counter(cfg['patterns'][seq]).most_common(1)[0][0]
+                if pred_lvl > seq[-1]: up += 1
+                elif pred_lvl < seq[-1]: down += 1
+        
+        res = "LONG" if (up > 0 and down == 0) else "SHORT" if (down > 0 and up == 0) else "NEUTRAL"
+        return res, p_market
+    except Exception as e:
+        logger.debug(f"Inference error for {symbol}: {e}")
+        return "ERROR", None
+
+def start_multi_asset_loop(loaded_models, anchor_prices):
+    exchange = ccxt.binance({'enableRateLimit': True})
+    entry_tracker = load_entry_prices()
+    logger.info("Bot Live - Frequency: 30m")
+    
+    while True:
+        try:
+            for symbol, model_data in loaded_models.items():
+                anchor = anchor_prices.get(symbol)
+                new_pred, p_market = run_single_asset_live(symbol, anchor, model_data, exchange)
                 
-                time.sleep(interval)
-            except Exception as e:
-                octopus_log(f"[{symbol}] Loop Step {i} failed: {e}", "warning")
+                if new_pred != "ERROR":
+                    settle_and_update_fast(symbol, new_pred, p_market, entry_tracker)
+                
+                time.sleep(REQUEST_DELAY)
 
-        if order_id:
-            octopus_log(f"[{symbol}] Loop finished. Cancelling remaining order {order_id}.")
-            try: self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
-            except: pass
+            now = time.time()
+            sleep_time = ((now // 1800) + 1) * 1800 - now + 10 
+            logger.info(f"Cycle complete. Sleeping {sleep_time/60:.2f} minutes...")
+            time.sleep(sleep_time)
+        except Exception as e:
+            logger.error(f"Loop error: {e}")
+            time.sleep(60)
+
+def main():
+    ensure_directories()
+    init_db()
+    
+    model_paths = download_models()
+    loaded_models = load_all_models(model_paths)
+    
+    if not loaded_models:
+        logger.error("No models were successfully loaded. Exiting.")
+        return
+
+    available_symbols = list(loaded_models.keys())
+    sample_count = min(2, len(available_symbols))
+    test_symbols = random.sample(available_symbols, sample_count)
+    
+    logger.info(f"--- STARTUP VALIDATION: {test_symbols} ---")
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    validation_passed = True
+    for sym in test_symbols:
+        anchor = loaded_models[sym]['initial_price']
+        pred, p_m = run_single_asset_live(sym, anchor, loaded_models[sym], exchange)
+        if pred == "ERROR":
+            validation_passed = False
+            break
+        logger.info(f"PRE-FLIGHT: {sym} OK. Price: {p_m}")
+
+    if validation_passed:
+        anchors = {sym: loaded_models[sym]['initial_price'] for sym in loaded_models}
+        start_multi_asset_loop(loaded_models, anchors)
+    else:
+        logger.error("System halted due to validation failure.")
 
 if __name__ == "__main__":
-    bot = Octopus()
-    bot.initialize()
-    bot.run()
+    main()
