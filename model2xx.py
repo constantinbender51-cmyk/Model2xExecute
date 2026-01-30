@@ -33,7 +33,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 DATA_URL = "https://web-production-73e1d.up.railway.app/"
 
 # Strategy Constants (Strict Uppercase for Matching)
-TARGET_SYMBOL = "FF_ETHUSD_260130"
+TARGET_SYMBOL = "FF_ETHUSD_260227"
 LEVERAGE = 1.0
 TIMEFRAME_MINUTES = 1
 TRIGGER_OFFSET_SEC = 3
