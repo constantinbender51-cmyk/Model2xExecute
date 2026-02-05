@@ -190,6 +190,12 @@ class Octopus:
                 if order_id: self._cancel_ignore_error(order_id, exec_symbol)
                 return
 
+            # THRESHOLD CHECK: Skip if change is less than 10% of current position
+            if curr_qty != 0 and abs(delta) < (abs(curr_qty) * 0.10):
+                octopus_log(f"Delta too small (<10% of Pos). Delta: {delta:.4f}. Stopping.")
+                if order_id: self._cancel_ignore_error(order_id, exec_symbol)
+                return
+
             # 4. Calculate Order Params
             side = "buy" if delta > 0 else "sell"
             abs_delta = abs(delta)
@@ -237,6 +243,11 @@ class Octopus:
             delta = target_qty - curr_qty
             
             if abs(delta) >= specs["sizeStep"]:
+                # Final Threshold Check for Sweep
+                if curr_qty != 0 and abs(delta) < (abs(curr_qty) * 0.10):
+                    octopus_log("Sweep Cancelled: Delta < 10%.")
+                    return
+
                 side = "buy" if delta > 0 else "sell"
                 size = self._round_to_step(abs(delta), specs["sizeStep"])
                 octopus_log(f"SWEEPING MKT: {side.upper()} {size} (Delta: {delta:.4f})")
